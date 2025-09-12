@@ -1,98 +1,438 @@
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react'
+import { createContext, useContext, useEffect, useState, ReactNode, useCallback, useMemo } from 'react'
 import { User, Session } from '@supabase/supabase-js'
-import { supabase } from '@/lib/supabase'
+import { supabase, getUserProfile, upsertUserProfile, getCurrentUser, safeAuthOperations } from '@/lib/supabase'
+import type { Database } from '@/types/supabase'
+
+type Profile = Database['public']['Tables']['profiles']['Row']
 
 interface AuthContextType {
   user: User | null
   session: Session | null
+  profile: Profile | null
   loading: boolean
-  signUp: (email: string, password: string, fullName?: string) => Promise<void>
-  signIn: (email: string, password: string) => Promise<void>
-  signInWithMagicLink: (email: string) => Promise<void>
-  signOut: () => Promise<void>
-  resetPassword: (email: string) => Promise<void>
+  error: string | null
+  signUp: (email: string, password: string, fullName?: string) => Promise<{ error: any }>
+  signIn: (email: string, password: string, rememberMe?: boolean) => Promise<{ error: any }>
+  signInWithMagicLink: (email: string) => Promise<{ error: any }>
+  signInWithGoogle: () => Promise<{ error: any }>
+  signInWithLinkedIn: () => Promise<{ error: any }>
+  signOut: () => Promise<{ error: any }>
+  resetPassword: (email: string) => Promise<{ error: any }>
+  updateProfile: (updates: Partial<Profile>) => Promise<{ error: any }>
+  refreshProfile: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
+// Helper function to extract name from OAuth metadata
+const extractNameFromOAuthMetadata = (metadata: any): string | null => {
+  if (!metadata) return null;
+  
+  // Primary: full_name from metadata
+  if (metadata.full_name && metadata.full_name.trim()) {
+    return metadata.full_name.trim();
+  }
+  
+  // Secondary: name from metadata
+  if (metadata.name && metadata.name.trim()) {
+    return metadata.name.trim();
+  }
+  
+  // Tertiary: first_name + last_name from metadata
+  if (metadata.first_name && metadata.last_name) {
+    return `${metadata.first_name.trim()} ${metadata.last_name.trim()}`.trim();
+  }
+  
+  if (metadata.first_name && metadata.first_name.trim()) {
+    return metadata.first_name.trim();
+  }
+  
+  // Quaternary: given_name + family_name from metadata (Google OAuth)
+  if (metadata.given_name && metadata.family_name) {
+    return `${metadata.given_name.trim()} ${metadata.family_name.trim()}`.trim();
+  }
+  
+  if (metadata.given_name && metadata.given_name.trim()) {
+    return metadata.given_name.trim();
+  }
+  
+  // Quinary: nickname from metadata
+  if (metadata.nickname && metadata.nickname.trim()) {
+    return metadata.nickname.trim();
+  }
+  
+  // Senary: preferred_username from metadata
+  if (metadata.preferred_username && metadata.preferred_username.trim()) {
+    return metadata.preferred_username.trim();
+  }
+  
+  return null;
+};
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [session, setSession] = useState<Session | null>(null)
+  const [profile, setProfile] = useState<Profile | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [isSigningOut, setIsSigningOut] = useState(false)
+
+  // Load user profile when user changes - memoized to prevent unnecessary re-renders
+  const loadUserProfile = useCallback(async (userId: string) => {
+    try {
+      let profileData = await getUserProfile(userId)
+      
+      // If profile doesn't exist, create it
+      if (!profileData) {
+        const user = await getCurrentUser()
+        if (user) {
+          // Enhanced name extraction from OAuth metadata
+          const extractedName = extractNameFromOAuthMetadata(user.user_metadata)
+          
+          const newProfileData = {
+            id: userId,
+            email: user.email || '',
+            full_name: extractedName,
+            avatar_url: user.user_metadata?.avatar_url || user.user_metadata?.picture || null,
+          }
+          
+          profileData = await upsertUserProfile(newProfileData)
+        }
+      }
+      
+      setProfile(profileData)
+    } catch (err: any) {
+      console.error('Error loading user profile:', err)
+      setError(err.message)
+    }
+  }, [])
 
   useEffect(() => {
+    let mounted = true
+
     // Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session)
-      setUser(session?.user ?? null)
-      setLoading(false)
-    })
+    const getInitialSession = async () => {
+      try {
+        const { data: { session }, error } = await supabase.auth.getSession()
+        
+        if (!mounted) return
+        
+        if (error) {
+          console.error('Error getting session:', error)
+          setError(error.message)
+        } else {
+          setSession(session)
+          setUser(session?.user ?? null)
+          
+          // Load profile if user exists
+          if (session?.user) {
+            await loadUserProfile(session.user.id)
+          }
+        }
+      } catch (err) {
+        console.error('Error in getInitialSession:', err)
+        if (mounted) {
+          setError(err instanceof Error ? err.message : 'Unknown error')
+        }
+      } finally {
+        if (mounted) {
+          setLoading(false)
+        }
+      }
+    }
+
+    getInitialSession()
 
     // Listen for auth changes
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (!mounted) return
+      
+      // Don't process auth state changes during logout
+      if (isSigningOut) {
+        return
+      }
+      
       setSession(session)
       setUser(session?.user ?? null)
+      setError(null)
+      
+      // Load profile if user exists
+      if (session?.user) {
+        await loadUserProfile(session.user.id)
+      } else {
+        setProfile(null)
+      }
+      
       setLoading(false)
     })
 
-    return () => subscription.unsubscribe()
-  }, [])
+    // Timeout protection - force loading to false after 10 seconds
+    const timeout = setTimeout(() => {
+      if (mounted && loading) {
+        setLoading(false)
+      }
+    }, 10000)
+
+    return () => {
+      mounted = false
+      clearTimeout(timeout)
+      subscription.unsubscribe()
+    }
+  }, [loadUserProfile, loading])
 
   const signUp = async (email: string, password: string, fullName?: string) => {
-    const { error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          full_name: fullName,
+    try {
+      setError(null)
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            full_name: fullName,
+          },
         },
-      },
-    })
-    if (error) throw error
+      })
+      
+      if (error) {
+        setError(error.message)
+        return { error }
+      }
+
+      // Create profile if signup was successful
+      if (data.user) {
+        await upsertUserProfile({
+          id: data.user.id,
+          email: data.user.email!,
+          full_name: fullName || null,
+        })
+      }
+
+      return { error: null }
+    } catch (err: any) {
+      setError(err.message)
+      return { error: err }
+    }
   }
 
-  const signIn = async (email: string, password: string) => {
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    })
-    if (error) throw error
+  const signIn = async (email: string, password: string, rememberMe = false) => {
+    try {
+      setError(null)
+      const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      })
+      
+      if (error) {
+        setError(error.message)
+        return { error }
+      }
+
+      return { error: null }
+    } catch (err: any) {
+      setError(err.message)
+      return { error: err }
+    }
   }
 
   const signInWithMagicLink = async (email: string) => {
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: {
-        emailRedirectTo: `${window.location.origin}/auth/callback`,
-      },
-    })
-    if (error) throw error
+    try {
+      setError(null)
+      const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: {
+          emailRedirectTo: `${window.location.origin}/auth/callback`,
+        },
+      })
+      
+      if (error) {
+        setError(error.message)
+        return { error }
+      }
+
+      return { error: null }
+    } catch (err: any) {
+      setError(err.message)
+      return { error: err }
+    }
   }
 
   const signOut = async () => {
-    const { error } = await supabase.auth.signOut()
-    if (error) throw error
+    try {
+      setError(null)
+      setIsSigningOut(true)
+      
+      console.log('Starting sign out process...')
+      
+      // Clear local state immediately to prevent hanging
+      setUser(null)
+      setSession(null)
+      setProfile(null)
+      setLoading(false)
+      
+      // Clear all Supabase-related localStorage items
+      try {
+        console.log('Clearing localStorage...')
+        Object.keys(localStorage).forEach(key => {
+          if (key.startsWith('sb-') || key.includes('supabase') || key.includes('auth')) {
+            localStorage.removeItem(key)
+          }
+        })
+        
+        // Also clear sessionStorage
+        Object.keys(sessionStorage).forEach(key => {
+          if (key.startsWith('sb-') || key.includes('supabase') || key.includes('auth')) {
+            sessionStorage.removeItem(key)
+          }
+        })
+      } catch (e) {
+        console.warn('Error clearing storage:', e)
+      }
+      
+      // Try to call Supabase signOut with timeout (non-blocking)
+      try {
+        console.log('Attempting Supabase signOut...')
+        const signOutPromise = supabase.auth.signOut()
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('SignOut timeout')), 3000)
+        )
+        
+        await Promise.race([signOutPromise, timeoutPromise])
+        console.log('Supabase signOut completed')
+      } catch (signOutError) {
+        console.warn('Supabase signOut failed or timed out:', signOutError)
+        // Continue anyway - local state is already cleared
+      }
+      
+      console.log('Sign out process completed')
+      return { error: null }
+    } catch (err: any) {
+      console.error('SignOut exception:', err)
+      setError(err.message)
+      return { error: err }
+    } finally {
+      setIsSigningOut(false)
+    }
   }
 
   const resetPassword = async (email: string) => {
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/auth/reset-password`,
-    })
-    if (error) throw error
+    try {
+      setError(null)
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/auth/reset-password`,
+      })
+      
+      if (error) {
+        setError(error.message)
+        return { error }
+      }
+
+      return { error: null }
+    } catch (err: any) {
+      setError(err.message)
+      return { error: err }
+    }
   }
 
-  const value = {
+  const signInWithGoogle = async () => {
+    try {
+      setError(null)
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: `${window.location.origin}/dashboard`,
+        },
+      })
+      return { error }
+    } catch (err: any) {
+      setError(err.message)
+      return { error: err }
+    }
+  }
+
+  const signInWithLinkedIn = async () => {
+    try {
+      setError(null)
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'linkedin_oidc',
+        options: {
+          redirectTo: `${window.location.origin}/dashboard`,
+        },
+      })
+      return { error }
+    } catch (err: any) {
+      setError(err.message)
+      return { error: err }
+    }
+  }
+
+  const updateProfile = async (updates: Partial<Profile>) => {
+    try {
+      if (!user) {
+        const error = new Error('User not authenticated')
+        setError(error.message)
+        return { error }
+      }
+
+      setError(null)
+      const { error } = await supabase
+        .from('profiles')
+        .update(updates)
+        .eq('id', user.id)
+
+      if (error) {
+        setError(error.message)
+        return { error }
+      }
+
+      // Refresh profile data
+      await refreshProfile()
+      return { error: null }
+    } catch (err: any) {
+      setError(err.message)
+      return { error: err }
+    }
+  }
+
+  const refreshProfile = useCallback(async () => {
+    if (user) {
+      await loadUserProfile(user.id)
+    }
+  }, [user, loadUserProfile])
+
+  // Memoize the context value to prevent unnecessary re-renders
+  const value = useMemo(() => ({
     user,
     session,
+    profile,
     loading,
+    error,
     signUp,
     signIn,
     signInWithMagicLink,
+    signInWithGoogle,
+    signInWithLinkedIn,
     signOut,
     resetPassword,
-  }
+    updateProfile,
+    refreshProfile,
+  }), [
+    user,
+    session,
+    profile,
+    loading,
+    error,
+    signUp,
+    signIn,
+    signInWithMagicLink,
+    signInWithGoogle,
+    signInWithLinkedIn,
+    signOut,
+    resetPassword,
+    updateProfile,
+    refreshProfile,
+  ])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
